@@ -170,7 +170,23 @@ def book():
         "total_price": price,
         "status": "reserved"
     })
+# ---- ROUTE DI CORTESIA ----
+@app.route("/", methods=["GET"])
+def root():
+    return {
+        "ok": True,
+        "service": "sicily-pricing-engine-v1",
+        "endpoints": {
+            "availability": "/availability?date=YYYY-MM-DD",
+            "quote": "/quote (POST)",
+            "book": "/book (POST)",
+            "health": "/healthz"
+        }
+    }, 200
 
+@app.route("/healthz", methods=["GET"])
+def health():
+    return "OK", 200
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
