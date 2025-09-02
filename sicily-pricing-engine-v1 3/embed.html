@@ -1,0 +1,36 @@
+<!-- embed.html -->
+<div id="booking-widget" style="font-family:system-ui,Arial,sans-serif;max-width:520px">
+  <h3 style="margin:0 0 8px">Sicily Starter Pack</h3>
+  <label>Check-in <input id="ci" type="date"></label><br>
+  <label>Check-out <input id="co" type="date"></label><br>
+  <label>Ospiti <input id="gu" type="number" min="1" max="6" value="2"></label><br>
+  <label>Coupon <input id="cp" type="text" placeholder="(opzionale)"></label><br><br>
+  <button id="btn-quote">Calcola preventivo</button>
+  <pre id="out" style="padding:12px;border:1px solid #ddd;border-radius:8px;margin-top:10px;white-space:pre-wrap"></pre>
+</div>
+
+<script>
+const API = "https://127.0.0.1:8000"; // es: https://yourapp.onrender.com
+const $ = (s)=>document.querySelector(s);
+$("#btn-quote").onclick = async () => {
+  const body = {
+    checkin: $("#ci").value,
+    checkout: $("#co").value,
+    guests: Number($("#gu").value),
+    coupon: ($("#cp").value||"").trim() || null
+  };
+  $("#out").textContent = "Calcolo in corso...";
+  try {
+    const r = await fetch(API + "/quote", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    if(!data.ok) throw new Error(data.error||"Errore");
+    $("#out").textContent = `Notti: ${data.nights}\nTotale: € ${data.total_price}\nProdotto: ${data.product}`;
+  } catch(e){
+    $("#out").textContent = "Errore: " + e.message;
+  }
+};
+</script>
