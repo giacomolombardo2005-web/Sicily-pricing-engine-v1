@@ -4,7 +4,37 @@ from flask import Flask, request, jsonify
 from collections import defaultdict
 import os
 from flask_cors import CORS
+# --- DB SETUP (SQLAlchemy + Postgres) ---
+import os
+from sqlalchemy import create_engine, text
 
+DATABASE_URL = os.getenv("DATABASE_URL")  # postgres://...
+engine = None
+if DATABASE_URL:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+# crea tabella se non esiste (molto semplice, stile demo)
+def init_db():
+    if not engine: 
+        return
+    with engine.begin() as conn:
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS bookings (
+            id SERIAL PRIMARY KEY,
+            booking_id VARCHAR(32) NOT NULL,
+            product_id VARCHAR(64) NOT NULL,
+            room_type VARCHAR(32) NOT NULL,
+            checkin DATE NOT NULL,
+            checkout DATE NOT NULL,
+            guests INTEGER NOT NULL,
+            total_price NUMERIC(10,2) NOT NULL,
+            customer_name TEXT NOT NULL,
+            customer_email TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        """))
+
+init_db()
 app = Flask(__name__)
 CORS(app)  # abilita chiamate dal widget Wix
 
@@ -151,18 +181,42 @@ def book():
     except:
         return jsonify({"ok":False,"error":"Parametri obbligatori: checkin, checkout, guests, customer"}), 400
 
-    ok, msg, price = quote_price(checkin, checkout, guests, coupon=data.get("coupon"))
+    room_type = (data.get("room_type") or "standard").lower()  # vedi sezione prezzi/stanze più sotto
+    ok, msg, price = quote_price(checkin, checkout, guests, coupon=data.get("coupon"), room_type=room_type)
     if not ok:
         return jsonify({"ok":False, "error":msg}), 400
 
-    # "blocca" capacità
+    # "blocca" capacità (demo in memoria)
     for d in daterange(checkin, checkout):
         BOOKINGS[d.strftime("%Y-%m-%d")] += 1
 
+    booking_id = f"BK-{int(datetime.utcnow().timestamp())}"
+
+    # salva su DB (se configurato)
+    if engine:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO bookings
+                (booking_id, product_id, room_type, checkin, checkout, guests, total_price, customer_name, customer_email)
+                VALUES
+                (:booking_id, :product_id, :room_type, :checkin, :checkout, :guests, :total_price, :customer_name, :customer_email)
+            """), dict(
+                booking_id=booking_id,
+                product_id=PRODUCT["id"],
+                room_type=room_type,
+                checkin=checkin.isoformat(),
+                checkout=checkout.isoformat(),
+                guests=guests,
+                total_price=price,
+                customer_name=customer["name"],
+                customer_email=customer["email"],
+            ))
+
     return jsonify({
         "ok": True,
-        "booking_id": f"BK-{int(datetime.utcnow().timestamp())}",
+        "booking_id": booking_id,
         "product": PRODUCT["id"],
+        "room_type": room_type,
         "customer": customer,
         "checkin": checkin.strftime("%Y-%m-%d"),
         "checkout": checkout.strftime("%Y-%m-%d"),
