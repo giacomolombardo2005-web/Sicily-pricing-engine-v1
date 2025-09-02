@@ -73,7 +73,14 @@ BOOKINGS = defaultdict(int)  # key: "YYYY-MM-DD" -> count
 
 # ---- UTIL ----
 def parse_date(s):
-    return datetime.strptime(s, "%Y-%m-%d").date()
+    # accetta "YYYY-MM-DD" oppure "DD/MM/YYYY"
+    s = (s or "").strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"Data non valida: '{s}'. Usa formato YYYY-MM-DD o DD/MM/YYYY")
 
 def daterange(d1, d2):
     cur = d1
@@ -178,39 +185,42 @@ def book():
         checkout = parse_date(data["checkout"])
         guests = int(data["guests"])
         customer = data["customer"]  # {"name":..., "email":...}
-    except:
-        return jsonify({"ok":False,"error":"Parametri obbligatori: checkin, checkout, guests, customer"}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Parametri non validi: {e}"}), 400
 
-    room_type = (data.get("room_type") or "standard").lower()  # vedi sezione prezzi/stanze più sotto
+    room_type = (data.get("room_type") or "standard").lower()
     ok, msg, price = quote_price(checkin, checkout, guests, coupon=data.get("coupon"), room_type=room_type)
     if not ok:
-        return jsonify({"ok":False, "error":msg}), 400
+        return jsonify({"ok": False, "error": msg}), 400
 
-    # "blocca" capacità (demo in memoria)
+    # blocco capacità demo
     for d in daterange(checkin, checkout):
         BOOKINGS[d.strftime("%Y-%m-%d")] += 1
 
     booking_id = f"BK-{int(datetime.utcnow().timestamp())}"
 
-    # salva su DB (se configurato)
-    if engine:
-        with engine.begin() as conn:
-            conn.execute(text("""
-                INSERT INTO bookings
-                (booking_id, product_id, room_type, checkin, checkout, guests, total_price, customer_name, customer_email)
-                VALUES
-                (:booking_id, :product_id, :room_type, :checkin, :checkout, :guests, :total_price, :customer_name, :customer_email)
-            """), dict(
-                booking_id=booking_id,
-                product_id=PRODUCT["id"],
-                room_type=room_type,
-                checkin=checkin.isoformat(),
-                checkout=checkout.isoformat(),
-                guests=guests,
-                total_price=price,
-                customer_name=customer["name"],
-                customer_email=customer["email"],
-            ))
+    # salva su DB se configurato
+    try:
+        if engine:
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO bookings
+                    (booking_id, product_id, room_type, checkin, checkout, guests, total_price, customer_name, customer_email)
+                    VALUES
+                    (:booking_id, :product_id, :room_type, :checkin, :checkout, :guests, :total_price, :customer_name, :customer_email)
+                """), dict(
+                    booking_id=booking_id,
+                    product_id=PRODUCT["id"],
+                    room_type=room_type,
+                    checkin=checkin.isoformat(),
+                    checkout=checkout.isoformat(),
+                    guests=guests,
+                    total_price=price,
+                    customer_name=customer.get("name",""),
+                    customer_email=customer.get("email",""),
+                ))
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Errore salvataggio DB: {e}"}), 500
 
     return jsonify({
         "ok": True,
@@ -224,6 +234,7 @@ def book():
         "total_price": price,
         "status": "reserved"
     })
+    
 # ---- ROUTE DI CORTESIA ----
 @app.route("/", methods=["GET"])
 def root():
