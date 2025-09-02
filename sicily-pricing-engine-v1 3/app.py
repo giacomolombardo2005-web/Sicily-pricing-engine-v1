@@ -1,9 +1,9 @@
-# app.py — Sicily Pricing Engine (v1.2)
-# - Flask + CORS
-# - Date tolleranti (YYYY-MM-DD o DD/MM/YYYY)
-# - Quote + Book
-# - / and /healthz
-# - Salvataggio su Postgres opzionale (DATABASE_URL)
+# app.py — Sicily Pricing Engine (v1.3)
+# - Endpoints per widget Wix: /availability, /quote, /book
+# - Route di cortesia: / e /healthz
+# - Postgres opzionale (DATABASE_URL)
+# - Email opzionali via SendGrid (SENDGRID_API_KEY, NOTIFY_EMAIL)
+# - Date tolleranti: "YYYY-MM-DD" o "DD/MM/YYYY"
 
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -11,18 +11,71 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 
-# --- DB (opzionale: si attiva se esiste DATABASE_URL) ---
+# ---------------------------
+#  Opzioni / Integrazioni
+# ---------------------------
+DATABASE_URL    = os.getenv("DATABASE_URL")        # es. postgres://...
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")   # opzionale
+NOTIFY_EMAIL     = os.getenv("NOTIFY_EMAIL")       # opzionale (mittente/destinatario)
+ADMIN_TOKEN      = os.getenv("ADMIN_TOKEN", "")    # opzionale per endpoint admin
+
+# DB opzionale (SQLAlchemy) — attivo solo se DATABASE_URL presente
 engine = None
-DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL:
     from sqlalchemy import create_engine, text
-    from sqlalchemy.exc import SQLAlchemyError
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+# Email opzionale (SendGrid) — attivo solo se API key + email presenti
+import requests
+def send_booking_email(booking_dict: dict):
+    """
+    Invia email best-effort. Se SENDGRID_API_KEY o NOTIFY_EMAIL mancano, esce senza fare nulla.
+    Puoi attivarla in futuro impostando le variabili d'ambiente su Render.
+    """
+    if not (SENDGRID_API_KEY and NOTIFY_EMAIL):
+        return  # email disabilitata
+
+    subject = f"Nuova prenotazione {booking_dict['booking_id']} - {booking_dict['customer']['name']}"
+    lines = [
+        "Nuova prenotazione ricevuta:",
+        f"Booking ID: {booking_dict['booking_id']}",
+        f"Prodotto: {booking_dict['product']} | Camera: {booking_dict['room_type']}",
+        f"Check-in: {booking_dict['checkin']} | Check-out: {booking_dict['checkout']}",
+        f"Ospiti: {booking_dict['guests']}",
+        f"Totale: € {booking_dict['total_price']}",
+        f"Cliente: {booking_dict['customer']['name']} <{booking_dict['customer']['email']}>",
+    ]
+    payload = {
+        "personalizations": [{
+            "to": [{"email": NOTIFY_EMAIL}],
+            "subject": subject
+        }],
+        "from": {"email": NOTIFY_EMAIL},
+        "content": [{"type": "text/plain", "value": "\n".join(lines)}]
+    }
+    # copia al cliente (se c'è)
+    customer_email = booking_dict.get("customer", {}).get("email")
+    if customer_email:
+        payload["personalizations"][0].setdefault("cc", []).append({"email": customer_email})
+
+    try:
+        r = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={"Authorization": f"Bearer {SENDGRID_API_KEY}",
+                     "Content-Type": "application/json"},
+            json=payload, timeout=10
+        )
+        r.raise_for_status()
+    except Exception as e:
+        # non blocchiamo la prenotazione per un problema email
+        app.logger.warning(f"SendGrid error: {e}")
 
 app = Flask(__name__)
 CORS(app)
 
-# ---- CONFIG PRODOTTO / LISTINI ----
+# ---------------------------
+#  Config prezzi / prodotto
+# ---------------------------
 ROOM_TYPES = {
     "standard": {"base_price_per_night": 70.0,  "max_guests": 2},
     "deluxe":   {"base_price_per_night": 95.0,  "max_guests": 3},
@@ -37,28 +90,27 @@ PRODUCT = {
     "capacity_per_day": 5
 }
 
-# Stagionalità (fattori moltiplicativi)
 SEASON_FACTORS = [
     {"from": "2025-06-01", "to": "2025-09-15", "factor": 1.25},   # alta
     {"from": "2025-12-20", "to": "2026-01-06", "factor": 1.20},   # festivo
 ]
 
-# Sconti prenotazione anticipata (giorni prima del check-in)
 ADVANCE_TIERS = [
     {"days": 120, "discount": 0.10},
     {"days": 60,  "discount": 0.06},
     {"days": 30,  "discount": 0.03},
 ]
 
-# Coupon
 COUPONS = {"WELCOME10": 0.10, "STUDENT5": 0.05}
 
-# "DB" di capacità in memoria (demo)
+# Capacità in memoria (demo); il DB salva solo le prenotazioni
 BOOKINGS = defaultdict(int)  # key = "YYYY-MM-DD" -> count
 
-# ---- UTIL ----
+# ---------------------------
+#  Util
+# ---------------------------
 def parse_date(s: str):
-    """Accetta 'YYYY-MM-DD' oppure 'DD/MM/YYYY'."""
+    """Accetta 'YYYY-MM-DD' o 'DD/MM/YYYY' e ritorna date()."""
     s = (s or "").strip()
     for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
         try:
@@ -73,8 +125,7 @@ def daterange(d1, d2):
         yield cur
         cur += timedelta(days=1)
 
-def is_blackout(d):
-    return d.strftime("%Y-%m-%d") in PRODUCT["blackout_dates"]
+def is_blackout(d): return d.strftime("%Y-%m-%d") in PRODUCT["blackout_dates"]
 
 def season_factor(d):
     for s in SEASON_FACTORS:
@@ -98,29 +149,23 @@ def quote_price(checkin, checkout, guests, *, coupon=None, today=None, room_type
         return (False, f"Tipologia camera non valida: {room_type}", None)
 
     RT = ROOM_TYPES[room_type]
-
     if guests < 1 or guests > RT["max_guests"]:
-        return (False, f"Numero ospiti non valido per {room_type} (max {RT['max_guests']})", None)
+        return (False, f"Ospiti non validi per {room_type} (max {RT['max_guests']})", None)
 
     nights = (checkout - checkin).days
     if nights < PRODUCT["min_stay_nights"]:
-        return (False, f"Soggiorno troppo breve (min {PRODUCT['min_stay_nights']} notti)", None)
+        return (False, f"Soggiorno minimo {PRODUCT['min_stay_nights']} notti", None)
 
-    # blackout / capacità
     for d in daterange(checkin, checkout):
-        if is_blackout(d):
-            return (False, f"Data non disponibile: {d}", None)
-        if not valid_capacity(d):
-            return (False, f"Superata capacità per il giorno: {d}", None)
+        if is_blackout(d):        return (False, f"Data non disponibile: {d}", None)
+        if not valid_capacity(d): return (False, f"Capacità esaurita nel giorno: {d}", None)
 
-    # prezzo base notte * stagionalità
     total = 0.0
     for d in daterange(checkin, checkout):
         total += RT["base_price_per_night"] * season_factor(d)
 
-    # sovrapprezzo ospiti extra (>2)
     if guests > 2:
-        total *= (1 + 0.10 * (guests - 2))
+        total *= (1 + 0.10 * (guests - 2))  # +10% per ospite oltre 2
 
     if not today:
         today = datetime.utcnow().date()
@@ -131,7 +176,9 @@ def quote_price(checkin, checkout, guests, *, coupon=None, today=None, room_type
 
     return (True, "ok", round(total, 2))
 
-# ---- INIT DB (solo se DATABASE_URL presente) ----
+# ---------------------------
+#  Init DB (se disponibile)
+# ---------------------------
 def init_db():
     if not engine:
         return
@@ -153,10 +200,12 @@ def init_db():
         """))
 
 if engine:
-    from sqlalchemy import text  # già importato sopra se engine
+    from sqlalchemy import text  # import qui per sicurezza
     init_db()
 
-# ---- ROUTES ----
+# ---------------------------
+#  Routes pubbliche
+# ---------------------------
 @app.route("/", methods=["GET"])
 def root():
     return {
@@ -191,10 +240,10 @@ def availability():
 def quote():
     data = request.json or {}
     try:
-        checkin  = parse_date(data["checkin"])
-        checkout = parse_date(data["checkout"])
-        guests   = int(data["guests"])
-        coupon   = data.get("coupon")
+        checkin   = parse_date(data["checkin"])
+        checkout  = parse_date(data["checkout"])
+        guests    = int(data["guests"])
+        coupon    = data.get("coupon")
         room_type = (data.get("room_type") or "standard").lower()
     except Exception as e:
         return jsonify({"ok": False, "error": f"Parametri non validi: {e}"}), 400
@@ -216,10 +265,10 @@ def quote():
 def book():
     data = request.json or {}
     try:
-        checkin  = parse_date(data["checkin"])
-        checkout = parse_date(data["checkout"])
-        guests   = int(data["guests"])
-        customer = data["customer"]  # {"name":..., "email":...}
+        checkin   = parse_date(data["checkin"])
+        checkout  = parse_date(data["checkout"])
+        guests    = int(data["guests"])
+        customer  = data["customer"]  # {"name":..., "email":...}
         room_type = (data.get("room_type") or "standard").lower()
     except Exception as e:
         return jsonify({"ok": False, "error": f"Parametri non validi: {e}"}), 400
@@ -228,7 +277,7 @@ def book():
     if not ok:
         return jsonify({"ok": False, "error": msg}), 400
 
-    # blocca capacità (demo)
+    # blocco capacità (demo in memoria)
     for d in daterange(checkin, checkout):
         BOOKINGS[d.strftime("%Y-%m-%d")] += 1
 
@@ -255,10 +304,10 @@ def book():
                     customer_email=customer.get("email",""),
                 ))
         except Exception as e:
-            # se il DB fallisce, restituiamo errore chiaro
             return jsonify({"ok": False, "error": f"Errore salvataggio DB: {e}"}), 500
 
-    return jsonify({
+    # risposta standard
+    response = {
         "ok": True,
         "booking_id": booking_id,
         "product": PRODUCT["id"],
@@ -269,8 +318,60 @@ def book():
         "guests": guests,
         "total_price": price,
         "status": "reserved"
-    })
+    }
 
+    # email best-effort (non blocca la prenotazione se fallisce)
+    try:
+        send_booking_email(response)
+    except Exception as e:
+        app.logger.warning(f"Email error: {e}")
+
+    return jsonify(response)
+
+# ---------------------------
+#  Endpoint admin (opzionali)
+# ---------------------------
+def _is_admin(req): return bool(ADMIN_TOKEN) and req.args.get("token") == ADMIN_TOKEN
+
+@app.route("/admin/bookings", methods=["GET"])
+def admin_bookings():
+    if not _is_admin(request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 403
+    if not engine:
+        return jsonify({"ok": True, "db": False, "note": "DB non configurato",
+                        "bookings_sample": list(BOOKINGS.items())[:10]})
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT booking_id, product_id, room_type, checkin, checkout, guests,
+                   total_price, customer_name, customer_email, created_at
+            FROM bookings
+            ORDER BY created_at DESC
+            LIMIT 200
+        """)).mappings().all()
+    return jsonify({"ok": True, "count": len(rows), "items": [dict(r) for r in rows]})
+
+@app.route("/admin/export.csv", methods=["GET"])
+def admin_export_csv():
+    if not _is_admin(request):
+        return "Unauthorized", 403
+    if not engine:
+        return "DB non configurato", 400
+    import csv, io
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT booking_id, product_id, room_type, checkin, checkout, guests,
+                   total_price, customer_name, customer_email, created_at
+            FROM bookings
+            ORDER BY created_at DESC
+        """)).all()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["booking_id","product_id","room_type","checkin","checkout","guests",
+                "total_price","customer_name","customer_email","created_at"])
+    w.writerows(rows)
+    return buf.getvalue(), 200, {"Content-Type": "text/csv; charset=utf-8"}
+
+# ---------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
